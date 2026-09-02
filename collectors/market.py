@@ -11,8 +11,63 @@ import yfinance as yf
 from config import MARKET_INDICES, WATCHLIST
 
 FDR_LOOKBACK_DAYS = 14
+FDR_TREND_LOOKBACK_DAYS = 120
 FDR_REQUEST_DELAY = 0.4
-YFINANCE_RETRY_DELAYS = (3, 8, 15)
+FDR_DATA_SOURCES = (None, "Naver", "Yahoo")
+YFINANCE_RETRY_DELAYS = (5, 12, 20)
+YFINANCE_ONLY_TICKERS = {"^VIX", "GC=F", "^TNX"}
+
+_close_series_cache: dict[tuple[str, int], pd.Series | None] = {}
+
+
+@dataclass
+class WatchlistTrend:
+    name: str
+    stock_code: str
+    price: float | None
+    change_1d: float | None
+    change_5d: float | None
+    change_20d: float | None
+    change_60d: float | None
+    low_20d: float | None
+    high_20d: float | None
+    low_60d: float | None
+    high_60d: float | None
+
+    def format_block(self) -> str:
+        lines = [f"- {self.name} ({self.stock_code})"]
+        if self.price is None:
+            lines.append("  시세/추세 데이터 없음")
+            return "\n".join(lines)
+
+        lines.append(f"  현재가: {self._fmt(self.price)}")
+        lines.append(
+            "  수익률: "
+            f"1일 {self._fmt_pct(self.change_1d)} / "
+            f"5일 {self._fmt_pct(self.change_5d)} / "
+            f"20일 {self._fmt_pct(self.change_20d)} / "
+            f"60일 {self._fmt_pct(self.change_60d)}"
+        )
+        if self.low_20d is not None and self.high_20d is not None:
+            lines.append(
+                f"  20일 구간: {self._fmt(self.low_20d)} ~ {self._fmt(self.high_20d)}"
+            )
+        if self.low_60d is not None and self.high_60d is not None:
+            lines.append(
+                f"  60일 구간: {self._fmt(self.low_60d)} ~ {self._fmt(self.high_60d)}"
+            )
+        return "\n".join(lines)
+
+    @staticmethod
+    def _fmt(value: float) -> str:
+        return f"{value:,.0f}"
+
+    @staticmethod
+    def _fmt_pct(value: float | None) -> str:
+        if value is None:
+            return "N/A"
+        sign = "+" if value >= 0 else ""
+        return f"{sign}{value:.2f}%"
 
 
 @dataclass
@@ -80,24 +135,119 @@ def _price_change_from_close(close: pd.Series) -> tuple[float | None, float | No
     return current, change_pct
 
 
-def _fetch_via_fdr(symbol: str) -> tuple[float | None, float | None]:
+def _fetch_close_series_fdr(symbol: str, lookback_days: int) -> pd.Series | None:
+    cache_key = (symbol, lookback_days)
+    if cache_key in _close_series_cache:
+        return _close_series_cache[cache_key]
+
     end = datetime.now()
-    start = end - timedelta(days=FDR_LOOKBACK_DAYS)
+    start = end - timedelta(days=lookback_days)
 
-    try:
-        data = fdr.DataReader(symbol, start, end)
-        if data is None or data.empty:
-            return None, None
+    for source in FDR_DATA_SOURCES:
+        try:
+            if source:
+                data = fdr.DataReader(symbol, start, end, data_source=source)
+            else:
+                data = fdr.DataReader(symbol, start, end)
 
-        if "Close" in data.columns:
-            close = data["Close"].dropna()
-        else:
-            close = data.iloc[:, -1].dropna()
+            if data is None or data.empty:
+                continue
 
-        return _price_change_from_close(close)
-    except Exception as exc:
-        print(f"FDR 조회 실패 ({symbol}): {exc}")
+            if "Close" in data.columns:
+                close = data["Close"].dropna()
+            else:
+                close = data.iloc[:, -1].dropna()
+
+            if not close.empty:
+                _close_series_cache[cache_key] = close
+                return close
+        except Exception as exc:
+            source_label = source or "default"
+            print(f"FDR 조회 실패 ({symbol}, {source_label}): {exc}")
+
+        time.sleep(FDR_REQUEST_DELAY)
+
+    _close_series_cache[cache_key] = None
+    return None
+
+
+def _period_return(close: pd.Series, days: int) -> float | None:
+    if len(close) <= days:
+        return None
+    previous = float(close.iloc[-(days + 1)])
+    current = float(close.iloc[-1])
+    if previous == 0:
+        return None
+    return ((current - previous) / previous) * 100
+
+
+def _range_window(close: pd.Series, days: int) -> tuple[float | None, float | None]:
+    window = close.tail(days)
+    if window.empty:
         return None, None
+    return float(window.min()), float(window.max())
+
+
+def fetch_watchlist_trends() -> list[WatchlistTrend]:
+    trends: list[WatchlistTrend] = []
+
+    for item in WATCHLIST:
+        close = _fetch_close_series_fdr(item["fdr"], FDR_TREND_LOOKBACK_DAYS)
+        if close is None or close.empty:
+            trends.append(
+                WatchlistTrend(
+                    name=item["name"],
+                    stock_code=item["fdr"],
+                    price=None,
+                    change_1d=None,
+                    change_5d=None,
+                    change_20d=None,
+                    change_60d=None,
+                    low_20d=None,
+                    high_20d=None,
+                    low_60d=None,
+                    high_60d=None,
+                )
+            )
+            time.sleep(FDR_REQUEST_DELAY)
+            continue
+
+        price = float(close.iloc[-1])
+        low_20d, high_20d = _range_window(close, 20)
+        low_60d, high_60d = _range_window(close, 60)
+        trends.append(
+            WatchlistTrend(
+                name=item["name"],
+                stock_code=item["fdr"],
+                price=price,
+                change_1d=_period_return(close, 1),
+                change_5d=_period_return(close, 5),
+                change_20d=_period_return(close, 20),
+                change_60d=_period_return(close, 60),
+                low_20d=low_20d,
+                high_20d=high_20d,
+                low_60d=low_60d,
+                high_60d=high_60d,
+            )
+        )
+        time.sleep(FDR_REQUEST_DELAY)
+
+    success_count = sum(1 for trend in trends if trend.price is not None)
+    print(f"워치리스트 추세 수집 성공: {success_count}/{len(trends)}")
+    return trends
+
+
+def format_watchlist_trends(trends: list[WatchlistTrend]) -> str:
+    lines = ["📈 워치리스트 추세·가격 구간 (시세 데이터 기반)"]
+    lines.extend(trend.format_block() for trend in trends)
+    return "\n".join(lines)
+
+
+def _fetch_via_fdr(symbol: str) -> tuple[float | None, float | None]:
+    close = _fetch_close_series_fdr(symbol, FDR_LOOKBACK_DAYS)
+    if close is None:
+        return None, None
+    return _price_change_from_close(close)
 
 
 def _download_yfinance_batch(tickers: list[str]) -> pd.DataFrame:
@@ -160,6 +310,20 @@ def fetch_market_quotes() -> list[Quote]:
     quotes: list[Quote] = []
     yfinance_fallback: list[tuple[int, str]] = []
 
+    yfinance_first = [
+        (index, str(instrument["yf"]))
+        for index, instrument in enumerate(instruments)
+        if instrument["yf"] in YFINANCE_ONLY_TICKERS
+    ]
+    yfinance_first_indices = {index for index, _ in yfinance_first}
+    yfinance_prefetch: pd.DataFrame = pd.DataFrame()
+
+    if yfinance_first:
+        prefetch_tickers = [ticker for _, ticker in yfinance_first]
+        print(f"yfinance 우선 조회: {len(prefetch_tickers)}개")
+        time.sleep(3)
+        yfinance_prefetch = _download_yfinance_batch(prefetch_tickers)
+
     for index, instrument in enumerate(instruments):
         name = str(instrument["name"])
         group = str(instrument["group"])
@@ -169,13 +333,20 @@ def fetch_market_quotes() -> list[Quote]:
         price, change_pct = None, None
         source = ""
 
-        if fdr_symbol:
+        if index in yfinance_first_indices and not yfinance_prefetch.empty:
+            price, change_pct = _fetch_via_yfinance(
+                yf_ticker, yfinance_prefetch, prefetch_tickers
+            )
+            if price is not None:
+                source = "yfinance"
+
+        if price is None and fdr_symbol:
             price, change_pct = _fetch_via_fdr(str(fdr_symbol))
             if price is not None:
                 source = "FDR"
             time.sleep(FDR_REQUEST_DELAY)
 
-        if price is None and yf_ticker:
+        if price is None and yf_ticker and index not in yfinance_first_indices:
             yfinance_fallback.append((index, yf_ticker))
 
         quotes.append(
@@ -192,7 +363,7 @@ def fetch_market_quotes() -> list[Quote]:
     if yfinance_fallback:
         fallback_tickers = [ticker for _, ticker in yfinance_fallback]
         print(f"yfinance 보조 조회 시작: {len(fallback_tickers)}개")
-        time.sleep(2)
+        time.sleep(5)
         yf_data = _download_yfinance_batch(fallback_tickers)
 
         for quote_index, ticker in yfinance_fallback:

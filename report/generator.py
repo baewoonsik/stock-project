@@ -46,15 +46,32 @@ def _generate_with_fallback(prompt: str, step_name: str) -> str:
     )
 
 
-def extract_facts(market_data: str, news_data: str) -> str:
-    prompt = STAGE1_PROMPT.format(market_data=market_data, news_data=news_data)
+def extract_facts(
+    market_data: str,
+    financial_data: str,
+    watchlist_data: str,
+    news_data: str,
+) -> str:
+    prompt = STAGE1_PROMPT.format(
+        market_data=market_data,
+        financial_data=financial_data,
+        watchlist_data=watchlist_data,
+        news_data=news_data,
+    )
     return _generate_with_fallback(prompt, "1단계 사실 추출")
 
 
-def generate_report_parts(facts: str, market_data: str) -> list[str]:
+def generate_report_parts(
+    facts: str,
+    market_data: str,
+    financial_data: str,
+    watchlist_data: str,
+) -> list[str]:
     prompt = STAGE2_PROMPT.format(
         facts=facts,
         market_data=market_data,
+        financial_data=financial_data,
+        watchlist_data=watchlist_data,
         message_break=MESSAGE_BREAK,
     )
     report_text = _generate_with_fallback(prompt, "2단계 리포트 생성")

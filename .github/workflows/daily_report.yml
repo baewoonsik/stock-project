@@ -28,5 +28,6 @@ jobs:
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          DART_API_KEY: ${{ secrets.DART_API_KEY }}
           GEMINI_MODEL: gemini-3.5-flash
         run: python main.py

@@ -4,7 +4,13 @@ from datetime import datetime
 
 import requests
 
-from collectors.market import fetch_market_quotes, format_market_snapshot
+from collectors.dart import fetch_financial_highlights, format_financial_data
+from collectors.market import (
+    fetch_market_quotes,
+    fetch_watchlist_trends,
+    format_market_snapshot,
+    format_watchlist_trends,
+)
 from collectors.news import fetch_news_items, format_news_data
 from config import MIN_MARKET_DATA_SUCCESS_RATIO, SLACK_MESSAGE_MAX_LENGTH
 from report.generator import extract_facts, generate_report_parts
@@ -56,16 +62,32 @@ def main() -> None:
         )
         sys.exit(1)
 
+    print("워치리스트 추세 데이터 수집 중...")
+    watchlist_trends = fetch_watchlist_trends()
+    watchlist_data = format_watchlist_trends(watchlist_trends)
+
+    prices_by_stock = {
+        trend.stock_code: trend.price
+        for trend in watchlist_trends
+        if trend.price is not None
+    }
+
+    print("DART 재무 데이터 수집 중...")
+    financial_highlights = fetch_financial_highlights(prices_by_stock)
+    financial_data = format_financial_data(financial_highlights)
+
     print("뉴스 헤드라인 수집 중...")
     news_items = fetch_news_items()
     news_data = format_news_data(news_items)
     print(f"뉴스 수집 완료: {len(news_items)}개")
 
     print("1단계: 사실 추출 중...")
-    facts = extract_facts(market_data, news_data)
+    facts = extract_facts(market_data, financial_data, watchlist_data, news_data)
 
     print("2단계: 상세 리포트 생성 중...")
-    report_parts = generate_report_parts(facts, market_data)
+    report_parts = generate_report_parts(
+        facts, market_data, financial_data, watchlist_data
+    )
     print(f"리포트 파트 수: {len(report_parts)}")
 
     print("슬랙으로 리포트 전송 중...")
