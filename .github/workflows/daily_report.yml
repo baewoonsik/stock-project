@@ -1,10 +1,12 @@
 name: Daily Stock Report Bot
 
 on:
-  schedule:
-  # UTC 23:00 = KST 08:00
-    - cron: '0 23 * * *'
   workflow_dispatch:
+  schedule:
+    - cron: '0 23 * * *'  # UTC 23:00 = KST 08:00
+
+permissions:
+  contents: read
 
 jobs:
   build_and_run:
