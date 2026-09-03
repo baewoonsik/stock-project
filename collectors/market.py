@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 
 import pandas as pd
 
+from collectors.price_sources import fetch_close_http
 from config import MARKET_INDICES, WATCHLIST
 
 FDR_LOOKBACK_DAYS = 14
@@ -15,63 +16,56 @@ FDR_REQUEST_DELAY = 0.4
 FDR_DATA_SOURCES = (None, "Naver", "Yahoo")
 YFINANCE_RETRY_DELAYS = (5, 12, 20)
 YFINANCE_ONLY_TICKERS = {"^VIX", "GC=F", "^TNX"}
-YFINANCE_BATCH_SIZE = 5
-YFINANCE_BATCH_DELAY = 8
+HTTP_REQUEST_DELAY = 0.2
 
 _close_series_cache: dict[tuple[str, int], pd.Series | None] = {}
-_yfinance_close_cache: dict[str, pd.Series] = {}
-_yfinance_prefetched = False
+_http_close_cache: dict[str, tuple[pd.Series, str]] = {}
+_http_prefetched = False
 
 
 def _is_ci() -> bool:
     return os.environ.get("GITHUB_ACTIONS") == "true"
 
 
-def _all_yfinance_tickers() -> list[str]:
-    tickers: list[str] = []
-    for item in MARKET_INDICES:
-        if item["yf"]:
-            tickers.append(item["yf"])
-    for item in WATCHLIST:
-        tickers.append(item["yf"])
-    return list(dict.fromkeys(tickers))
+def _all_instruments() -> list[dict]:
+    return list(MARKET_INDICES) + list(WATCHLIST)
 
 
-def _prefetch_all_yfinance() -> None:
-    global _yfinance_prefetched
+def _prefetch_all_http() -> None:
+    global _http_prefetched
 
-    if _yfinance_prefetched:
+    if _http_prefetched:
         return
 
-    tickers = _all_yfinance_tickers()
-    print(f"yfinance 일괄 prefetch 시작: {len(tickers)}개")
+    instruments = _all_instruments()
+    print(f"HTTP 시세 prefetch 시작: {len(instruments)}개 (Yahoo 미사용)")
 
-    for start in range(0, len(tickers), YFINANCE_BATCH_SIZE):
-        batch = tickers[start : start + YFINANCE_BATCH_SIZE]
-        data = _download_yfinance_history_batch(batch, period="6mo")
-        for ticker in batch:
-            close = _get_close_series(data, ticker, batch)
-            if close is not None and not close.empty:
-                _yfinance_close_cache[ticker] = close
-                _close_series_cache[(f"yf:{ticker}", FDR_TREND_LOOKBACK_DAYS)] = close
-            else:
-                close = _fetch_close_series_yfinance(ticker, FDR_TREND_LOOKBACK_DAYS)
-                if close is not None and not close.empty:
-                    _yfinance_close_cache[ticker] = close
-                else:
-                    print(f"yfinance prefetch 실패: {ticker}")
+    for item in instruments:
+        ticker = str(item["yf"])
+        close, source = fetch_close_http(
+            item["name"], item.get("fdr"), ticker, FDR_TREND_LOOKBACK_DAYS
+        )
+        if close is not None and not close.empty:
+            _http_close_cache[ticker] = (close, source)
+            _close_series_cache[(f"http:{ticker}", FDR_TREND_LOOKBACK_DAYS)] = close
+            print(f"시세 수집 성공 ({item['name']}): {source}")
+        else:
+            print(f"HTTP 시세 실패: {item['name']}")
+        time.sleep(HTTP_REQUEST_DELAY)
 
-        if start + YFINANCE_BATCH_SIZE < len(tickers):
-            time.sleep(YFINANCE_BATCH_DELAY)
-
-    success = len(_yfinance_close_cache)
-    print(f"yfinance prefetch 완료: {success}/{len(tickers)}")
-    _yfinance_prefetched = True
+    print(f"HTTP 시세 prefetch 완료: {len(_http_close_cache)}/{len(instruments)}")
+    _http_prefetched = True
 
 
 def ensure_market_data_prefetched() -> None:
-    if _is_ci():
-        _prefetch_all_yfinance()
+    _prefetch_all_http()
+
+
+def _close_from_http(ticker: str) -> tuple[pd.Series | None, str]:
+    cached = _http_close_cache.get(ticker)
+    if cached:
+        return cached
+    return None, ""
 
 def _import_fdr():
     import FinanceDataReader as fdr
@@ -208,7 +202,8 @@ def _fetch_close_series_fdr(symbol: str, lookback_days: int) -> pd.Series | None
     end = datetime.now()
     start = end - timedelta(days=lookback_days)
 
-    for source in FDR_DATA_SOURCES:
+    sources = (None, "Naver") if _is_ci() else FDR_DATA_SOURCES
+    for source in sources:
         try:
             fdr = _import_fdr()
             if source:
@@ -326,23 +321,17 @@ def _range_window(close: pd.Series, days: int) -> tuple[float | None, float | No
 
 
 def fetch_watchlist_trends() -> list[WatchlistTrend]:
-    if _is_ci():
-        _prefetch_all_yfinance()
-        trends = []
-        for item in WATCHLIST:
-            close = _yfinance_close_cache.get(item["yf"])
-            if close is not None and not close.empty:
-                trends.append(_build_watchlist_trend(item, close))
-            else:
-                trends.append(_empty_watchlist_trend(item))
-        success_count = sum(1 for trend in trends if trend.price is not None)
-        print(f"워치리스트 추세 수집 성공: {success_count}/{len(trends)}")
-        return trends
+    _prefetch_all_http()
 
     trends: list[WatchlistTrend] = []
     yfinance_fallback: list[tuple[int, str]] = []
 
     for index, item in enumerate(WATCHLIST):
+        close, _source = _close_from_http(item["yf"])
+        if close is not None and not close.empty:
+            trends.append(_build_watchlist_trend(item, close))
+            continue
+
         close = _fetch_close_series_fdr(item["fdr"], FDR_TREND_LOOKBACK_DAYS)
         if close is None or close.empty:
             yfinance_fallback.append((index, item["yf"]))
@@ -351,6 +340,13 @@ def fetch_watchlist_trends() -> list[WatchlistTrend]:
 
         trends.append(_build_watchlist_trend(item, close))
         time.sleep(FDR_REQUEST_DELAY)
+
+    if yfinance_fallback and _is_ci():
+        for trend_index, _ticker in yfinance_fallback:
+            print(f"워치리스트 시세 없음: {WATCHLIST[trend_index]['name']}")
+        success_count = sum(1 for trend in trends if trend.price is not None)
+        print(f"워치리스트 추세 수집 성공: {success_count}/{len(trends)}")
+        return trends
 
     if yfinance_fallback:
         fallback_tickers = [ticker for _, ticker in yfinance_fallback]
@@ -463,41 +459,7 @@ def _fetch_via_yfinance(ticker: str, data: pd.DataFrame, batch: list[str]) -> tu
 
 
 def fetch_market_quotes() -> list[Quote]:
-    if _is_ci():
-        _prefetch_all_yfinance()
-        quotes: list[Quote] = []
-
-        for item in MARKET_INDICES:
-            close = _yfinance_close_cache.get(item["yf"])
-            price, change_pct = _price_change_from_close(close) if close is not None else (None, None)
-            quotes.append(
-                Quote(
-                    name=item["name"],
-                    ticker=item["yf"],
-                    price=price,
-                    change_pct=change_pct,
-                    group=item["group"],
-                    source="yfinance" if price is not None else "",
-                )
-            )
-
-        for item in WATCHLIST:
-            close = _yfinance_close_cache.get(item["yf"])
-            price, change_pct = _price_change_from_close(close) if close is not None else (None, None)
-            quotes.append(
-                Quote(
-                    name=item["name"],
-                    ticker=item["yf"],
-                    price=price,
-                    change_pct=change_pct,
-                    group="워치리스트",
-                    source="yfinance" if price is not None else "",
-                )
-            )
-
-        success_count = sum(1 for quote in quotes if quote.price is not None)
-        print(f"시세 수집 성공: {success_count}/{len(quotes)}")
-        return quotes
+    _prefetch_all_http()
 
     instruments = _get_instruments()
     quotes: list[Quote] = []
@@ -506,10 +468,11 @@ def fetch_market_quotes() -> list[Quote]:
     yfinance_first = [
         (index, str(instrument["yf"]))
         for index, instrument in enumerate(instruments)
-        if instrument["yf"] in YFINANCE_ONLY_TICKERS
+        if instrument["yf"] in YFINANCE_ONLY_TICKERS and not _is_ci()
     ]
     yfinance_first_indices = {index for index, _ in yfinance_first}
     yfinance_prefetch: pd.DataFrame = pd.DataFrame()
+    prefetch_tickers: list[str] = []
 
     if yfinance_first:
         prefetch_tickers = [ticker for _, ticker in yfinance_first]
@@ -526,7 +489,12 @@ def fetch_market_quotes() -> list[Quote]:
         price, change_pct = None, None
         source = ""
 
-        if index in yfinance_first_indices and not yfinance_prefetch.empty:
+        close, http_source = _close_from_http(yf_ticker)
+        if close is not None and not close.empty:
+            price, change_pct = _price_change_from_close(close)
+            source = http_source
+
+        if price is None and index in yfinance_first_indices and not yfinance_prefetch.empty:
             price, change_pct = _fetch_via_yfinance(
                 yf_ticker, yfinance_prefetch, prefetch_tickers
             )
@@ -539,7 +507,7 @@ def fetch_market_quotes() -> list[Quote]:
                 source = "FDR"
             time.sleep(FDR_REQUEST_DELAY)
 
-        if price is None and yf_ticker and index not in yfinance_first_indices:
+        if price is None and yf_ticker and index not in yfinance_first_indices and not _is_ci():
             yfinance_fallback.append((index, yf_ticker))
 
         quotes.append(
