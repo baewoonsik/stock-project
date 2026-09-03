@@ -182,6 +182,77 @@ def _fetch_close_series_fdr(symbol: str, lookback_days: int) -> pd.Series | None
     return None
 
 
+def _fetch_close_series_yfinance(ticker: str, lookback_days: int) -> pd.Series | None:
+    cache_key = (f"yf:{ticker}", lookback_days)
+    if cache_key in _close_series_cache:
+        return _close_series_cache[cache_key]
+
+    try:
+        yf = _import_yfinance()
+        period = "6mo" if lookback_days >= 90 else "3mo"
+        data = yf.download(
+            ticker,
+            period=period,
+            auto_adjust=True,
+            threads=False,
+            progress=False,
+        )
+        if data is None or data.empty:
+            _close_series_cache[cache_key] = None
+            return None
+
+        if "Close" in data.columns:
+            close = data["Close"].dropna()
+        else:
+            close = data.iloc[:, -1].dropna()
+
+        if close.empty:
+            _close_series_cache[cache_key] = None
+            return None
+
+        _close_series_cache[cache_key] = close
+        return close
+    except Exception as exc:
+        print(f"yfinance 추세 조회 실패 ({ticker}): {exc}")
+        _close_series_cache[cache_key] = None
+        return None
+
+
+def _build_watchlist_trend(item: dict, close: pd.Series) -> WatchlistTrend:
+    price = float(close.iloc[-1])
+    low_20d, high_20d = _range_window(close, 20)
+    low_60d, high_60d = _range_window(close, 60)
+    return WatchlistTrend(
+        name=item["name"],
+        stock_code=item["fdr"],
+        price=price,
+        change_1d=_period_return(close, 1),
+        change_5d=_period_return(close, 5),
+        change_20d=_period_return(close, 20),
+        change_60d=_period_return(close, 60),
+        low_20d=low_20d,
+        high_20d=high_20d,
+        low_60d=low_60d,
+        high_60d=high_60d,
+    )
+
+
+def _empty_watchlist_trend(item: dict) -> WatchlistTrend:
+    return WatchlistTrend(
+        name=item["name"],
+        stock_code=item["fdr"],
+        price=None,
+        change_1d=None,
+        change_5d=None,
+        change_20d=None,
+        change_60d=None,
+        low_20d=None,
+        high_20d=None,
+        low_60d=None,
+        high_60d=None,
+    )
+
+
 def _period_return(close: pd.Series, days: int) -> float | None:
     if len(close) <= days:
         return None
@@ -201,47 +272,47 @@ def _range_window(close: pd.Series, days: int) -> tuple[float | None, float | No
 
 def fetch_watchlist_trends() -> list[WatchlistTrend]:
     trends: list[WatchlistTrend] = []
+    yfinance_fallback: list[tuple[int, str]] = []
 
-    for item in WATCHLIST:
+    for index, item in enumerate(WATCHLIST):
         close = _fetch_close_series_fdr(item["fdr"], FDR_TREND_LOOKBACK_DAYS)
         if close is None or close.empty:
-            trends.append(
-                WatchlistTrend(
-                    name=item["name"],
-                    stock_code=item["fdr"],
-                    price=None,
-                    change_1d=None,
-                    change_5d=None,
-                    change_20d=None,
-                    change_60d=None,
-                    low_20d=None,
-                    high_20d=None,
-                    low_60d=None,
-                    high_60d=None,
-                )
-            )
-            time.sleep(FDR_REQUEST_DELAY)
+            yfinance_fallback.append((index, item["yf"]))
+            trends.append(_empty_watchlist_trend(item))
             continue
 
-        price = float(close.iloc[-1])
-        low_20d, high_20d = _range_window(close, 20)
-        low_60d, high_60d = _range_window(close, 60)
-        trends.append(
-            WatchlistTrend(
-                name=item["name"],
-                stock_code=item["fdr"],
-                price=price,
-                change_1d=_period_return(close, 1),
-                change_5d=_period_return(close, 5),
-                change_20d=_period_return(close, 20),
-                change_60d=_period_return(close, 60),
-                low_20d=low_20d,
-                high_20d=high_20d,
-                low_60d=low_60d,
-                high_60d=high_60d,
-            )
-        )
+        trends.append(_build_watchlist_trend(item, close))
         time.sleep(FDR_REQUEST_DELAY)
+
+    if yfinance_fallback:
+        fallback_tickers = [ticker for _, ticker in yfinance_fallback]
+        print(f"워치리스트 yfinance 보조 조회: {len(fallback_tickers)}개")
+        time.sleep(2)
+
+        try:
+            yf = _import_yfinance()
+            batch_data = yf.download(
+                fallback_tickers,
+                period="6mo",
+                group_by="ticker",
+                auto_adjust=True,
+                threads=False,
+                progress=False,
+            )
+        except Exception as exc:
+            print(f"워치리스트 yfinance 배치 실패: {exc}")
+            batch_data = pd.DataFrame()
+
+        for trend_index, ticker in yfinance_fallback:
+            close = _get_close_series(batch_data, ticker, fallback_tickers)
+            if close is None or close.empty:
+                close = _fetch_close_series_yfinance(ticker, FDR_TREND_LOOKBACK_DAYS)
+            if close is not None and not close.empty:
+                trends[trend_index] = _build_watchlist_trend(
+                    WATCHLIST[trend_index], close
+                )
+            else:
+                print(f"워치리스트 시세 없음: {WATCHLIST[trend_index]['name']}")
 
     success_count = sum(1 for trend in trends if trend.price is not None)
     print(f"워치리스트 추세 수집 성공: {success_count}/{len(trends)}")

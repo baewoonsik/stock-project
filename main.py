@@ -77,10 +77,8 @@ def main() -> None:
 
     if watchlist_ratio < MIN_WATCHLIST_SUCCESS_RATIO:
         print(
-            "워치리스트 시세 수집률이 낮아 리포트를 중단합니다. "
-            f"(최소 {MIN_WATCHLIST_SUCCESS_RATIO:.0%} 필요)"
+            "경고: 워치리스트 시세 일부 누락. 가능한 데이터로 리포트를 계속 생성합니다."
         )
-        sys.exit(1)
 
     print("시장 데이터 수집 중...")
     quotes = fetch_market_quotes()
