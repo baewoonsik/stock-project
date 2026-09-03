@@ -2,8 +2,7 @@ from __future__ import annotations
 
 import ast
 import json
-import re
-import os
+import time
 from datetime import datetime, timedelta, timezone
 from io import StringIO
 
@@ -16,9 +15,8 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/128.0.0.0 Safari/537.36"
     ),
-    "Accept": "application/json,text/plain,*/*",
+    "Accept": "application/json,text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "ko-KR,ko;q=0.9,en;q=0.8",
-    "Referer": "https://finance.naver.com/",
 }
 
 NAVER_INDEX_SYMBOLS = {
@@ -26,46 +24,30 @@ NAVER_INDEX_SYMBOLS = {
     "KQ11": "KOSDAQ",
 }
 
-NAVER_WORLD_INDEX = {
-    "^GSPC": (".INX", ".GSPC"),
-    "^IXIC": (".IXIC",),
-    "^DJI": (".DJI",),
-    "^N225": (".N225",),
-    "^HSI": (".HSI",),
-    "^VIX": (".VIX", ".VXN"),
+# 브라우저에서 확인된 네이버 해외지수 JSON 심볼
+NAVER_WORLD_JSON = {
+    "^GSPC": "SPI@SPX",
+    "^IXIC": "NAS@IXIC",
+    "^DJI": "DJI@DJI",
+    "^N225": "NII@NI225",
+    "^HSI": "HSI@HSI",
 }
 
-NAVER_COMMODITY = {
-    "GC=F": "CMDT_GC",
-    "CL=F": "OIL_CL",
-}
-
-STOOQ_SYMBOLS = {
-    "^GSPC": "^spx",
-    "^IXIC": "^ndq",
-    "^DJI": "^dji",
-    "^N225": "^nkx",
-    "^HSI": "^hsi",
-    "^VIX": "^vix",
-    "USDKRW=X": "usdkrw",
-    "EURKRW=X": "eurkrw",
-    "JPYKRW=X": "jpykrw",
-    "GC=F": "gc.f",
-    "CL=F": "cl.f",
-    "BTC-USD": "btcusd",
-    "^TNX": "10usy.b",
-    "^KS11": "^kospi",
-    "^KQ11": "^kosdaq",
+NAVER_MARKETINDEX_HTML = {
+    "GC=F": (
+        "https://finance.naver.com/marketindex/worldDailyQuote.naver"
+        "?marketindexCd=CMDT_GC&fdtc=2&page={page}"
+    ),
+    "CL=F": (
+        "https://finance.naver.com/marketindex/worldDailyQuote.naver"
+        "?marketindexCd=OIL_CL&fdtc=2&page={page}"
+    ),
 }
 
 FX_PAIRS = {
     "USDKRW=X": ("USD", "KRW"),
     "EURKRW=X": ("EUR", "KRW"),
     "JPYKRW=X": ("JPY", "KRW"),
-}
-
-FRED_SERIES = {
-    "^TNX": "DGS10",
 }
 
 _session: requests.Session | None = None
@@ -93,6 +75,23 @@ def _to_float(value: object) -> float | None:
         return None
 
 
+def _parse_date(value: object) -> datetime:
+    text = re_sub_date(str(value).strip())
+    for size, fmt in ((10, "%Y-%m-%d"), (8, "%Y%m%d")):
+        try:
+            return datetime.strptime(text[:size], fmt)
+        except ValueError:
+            continue
+    raise ValueError(f"지원하지 않는 날짜: {value}")
+
+
+def re_sub_date(text: str) -> str:
+    text = text.replace("/", "-").replace(".", "-")
+    if "T" in text:
+        text = text.split("T", 1)[0]
+    return text.split(" ")[0]
+
+
 def _series_from_rows(rows: list[tuple[datetime, float]]) -> pd.Series | None:
     if not rows:
         return None
@@ -118,26 +117,31 @@ def fetch_close_http(
         if close is not None:
             return close, "Naver"
 
-    if yf in NAVER_WORLD_INDEX:
-        for code in NAVER_WORLD_INDEX[yf]:
-            close = _fetch_naver_world_index(code, lookback_days)
-            if close is not None:
-                return close, "Naver"
-
-    if yf in NAVER_COMMODITY:
-        close = _fetch_naver_commodity(NAVER_COMMODITY[yf], lookback_days)
+    if yf in NAVER_WORLD_JSON:
+        close = _fetch_naver_world_day_json(NAVER_WORLD_JSON[yf], lookback_days)
         if close is not None:
-            return close, "Naver"
+            return close, "NaverWorld"
 
-    if yf in FRED_SERIES:
-        close = _fetch_fred(FRED_SERIES[yf], lookback_days)
+    if yf == "^VIX":
+        close = _fetch_cboe_vix(lookback_days)
+        if close is not None:
+            return close, "CBOE"
+        close = _fetch_daum_days(".VIX", lookback_days)
+        if close is not None:
+            return close, "Daum"
+
+    if yf in NAVER_MARKETINDEX_HTML:
+        close = _fetch_naver_html_pages(NAVER_MARKETINDEX_HTML[yf], lookback_days)
+        if close is not None:
+            return close, "NaverMarket"
+
+    if yf == "^TNX":
+        close = _fetch_fred_dgs10(lookback_days)
         if close is not None:
             return close, "FRED"
-
-    if yf in STOOQ_SYMBOLS:
-        close = _fetch_stooq(STOOQ_SYMBOLS[yf], lookback_days)
+        close = _fetch_treasury_10y(lookback_days)
         if close is not None:
-            return close, "Stooq"
+            return close, "Treasury"
 
     if yf in FX_PAIRS:
         close = _fetch_frankfurter(*FX_PAIRS[yf], lookback_days)
@@ -149,16 +153,6 @@ def fetch_close_http(
         if close is not None:
             return close, "CoinGecko"
 
-    if yf in {"GC=F", "CL=F"}:
-        close = _fetch_stooq("xauusd" if yf == "GC=F" else "cl.f", lookback_days)
-        if close is not None:
-            return close, "Stooq"
-
-    if yf and os.environ.get("GITHUB_ACTIONS") != "true":
-        close = _fetch_yahoo_chart(yf, lookback_days)
-        if close is not None:
-            return close, "YahooChart"
-
     return None, ""
 
 
@@ -166,8 +160,9 @@ def _fetch_naver_stock(code: str, lookback_days: int) -> pd.Series | None:
     close = _fetch_naver_fchart(code, lookback_days)
     if close is not None:
         return close
-    return _fetch_naver_mobile_prices(
-        f"https://m.stock.naver.com/api/stock/{code}/price", lookback_days
+    return _fetch_json_price_list(
+        f"https://m.stock.naver.com/api/stock/{code}/price",
+        {"pageSize": max(lookback_days, 90), "page": 1},
     )
 
 
@@ -175,153 +170,39 @@ def _fetch_naver_index(symbol: str, lookback_days: int) -> pd.Series | None:
     close = _fetch_naver_fchart(symbol, lookback_days)
     if close is not None:
         return close
-    return _fetch_naver_mobile_prices(
-        f"https://m.stock.naver.com/api/index/{symbol}/price", lookback_days
+    return _fetch_json_price_list(
+        f"https://m.stock.naver.com/api/index/{symbol}/price",
+        {"pageSize": max(lookback_days, 90), "page": 1},
     )
-
-
-def _fetch_naver_world_index(code: str, lookback_days: int) -> pd.Series | None:
-    candle_count = max(lookback_days, 90)
-    endpoints = (
-        (
-            f"https://api.stock.naver.com/chart/foreign/index/{code}",
-            {"periodType": "day", "candleCount": candle_count},
-        ),
-        (
-            f"https://m.stock.naver.com/front-api/product/chart/foreign/index/{code}",
-            {"periodType": "day", "maxCount": candle_count},
-        ),
-        (
-            f"https://api.stock.naver.com/index/{code}/price",
-            {"page": 1, "pageSize": candle_count},
-        ),
-        (
-            f"https://m.stock.naver.com/api/index/{code}/price",
-            {"page": 1, "pageSize": candle_count},
-        ),
-    )
-
-    for url, params in endpoints:
-        close = _fetch_naver_json_series(url, params)
-        if close is not None:
-            return close
-    return None
-
-
-def _fetch_naver_commodity(code: str, lookback_days: int) -> pd.Series | None:
-    page_size = max(lookback_days, 90)
-    endpoints = (
-        (
-            f"https://api.stock.naver.com/marketindex/oilgold/{code}/price",
-            {"page": 1, "pageSize": page_size},
-        ),
-        (
-            f"https://m.stock.naver.com/front-api/marketIndex/prices/{code}",
-            {"page": 1, "pageSize": page_size},
-        ),
-        (
-            f"https://api.stock.naver.com/marketindex/{code}/price",
-            {"page": 1, "pageSize": page_size},
-        ),
-    )
-
-    for url, params in endpoints:
-        close = _fetch_naver_json_series(url, params)
-        if close is not None:
-            return close
-    return None
-
-
-def _fetch_naver_json_series(url: str, params: dict) -> pd.Series | None:
-    try:
-        response = _http().get(url, params=params, timeout=20)
-        if response.status_code != 200:
-            return None
-        payload = response.json()
-    except Exception as exc:
-        print(f"Naver JSON 실패 ({url}): {exc}")
-        return None
-
-    items = _extract_price_items(payload)
-    parsed: list[tuple[datetime, float]] = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        date_raw = (
-            item.get("localTradedAt")
-            or item.get("localDateTime")
-            or item.get("localDate")
-            or item.get("bizdate")
-            or item.get("date")
-            or item.get("trdDd")
-        )
-        close = _to_float(
-            item.get("closePrice")
-            or item.get("close")
-            or item.get("closeVal")
-            or item.get("lastPrice")
-            or item.get("nv")
-            or item.get("value")
-        )
-        if not date_raw or close is None:
-            continue
-        try:
-            parsed.append((_parse_date(date_raw), close))
-        except ValueError:
-            continue
-
-    return _series_from_rows(parsed)
-
-
-def _extract_price_items(payload: object) -> list:
-    if isinstance(payload, list):
-        return payload
-    if not isinstance(payload, dict):
-        return []
-
-    for key in (
-        "priceInfos",
-        "prices",
-        "candleDataList",
-        "chartDataList",
-        "data",
-        "result",
-    ):
-        value = payload.get(key)
-        if isinstance(value, list) and value:
-            return value
-        if isinstance(value, dict):
-            nested = _extract_price_items(value)
-            if nested:
-                return nested
-    return []
 
 
 def _fetch_naver_fchart(symbol: str, lookback_days: int) -> pd.Series | None:
     end = datetime.now()
     start = end - timedelta(days=lookback_days)
-    urls = (
+    for url in (
         "https://api.finance.naver.com/siseJson.naver",
         "https://fchart.stock.naver.com/siseJson.nhn",
-    )
-    params = {
-        "symbol": symbol,
-        "requestType": "1",
-        "startTime": start.strftime("%Y%m%d"),
-        "endTime": end.strftime("%Y%m%d"),
-        "timeframe": "day",
-    }
-
-    for url in urls:
+    ):
         try:
-            response = _http().get(url, params=params, timeout=20)
-            response.raise_for_status()
-            rows = _parse_naver_fchart(response.text)
-            if rows is not None:
-                return rows
+            response = _http().get(
+                url,
+                params={
+                    "symbol": symbol,
+                    "requestType": "1",
+                    "startTime": start.strftime("%Y%m%d"),
+                    "endTime": end.strftime("%Y%m%d"),
+                    "timeframe": "day",
+                },
+                timeout=30,
+                headers={**HEADERS, "Referer": "https://finance.naver.com/"},
+            )
+            if response.status_code != 200:
+                continue
+            series = _parse_naver_fchart(response.text)
+            if series is not None:
+                return series
         except Exception as exc:
-            print(f"Naver fchart 실패 ({symbol}, {url}): {exc}")
-
+            print(f"Naver fchart 실패 ({symbol}): {exc}")
     return None
 
 
@@ -329,7 +210,6 @@ def _parse_naver_fchart(text: str) -> pd.Series | None:
     payload = text.strip()
     if not payload or payload[0] not in "[{":
         return None
-
     try:
         rows = json.loads(payload)
     except json.JSONDecodeError:
@@ -337,7 +217,6 @@ def _parse_naver_fchart(text: str) -> pd.Series | None:
             rows = ast.literal_eval(payload)
         except (SyntaxError, ValueError):
             return None
-
     if not isinstance(rows, list) or len(rows) < 2:
         return None
 
@@ -345,145 +224,325 @@ def _parse_naver_fchart(text: str) -> pd.Series | None:
     for row in rows[1:]:
         if not row:
             continue
-        date_raw = str(row[0])
         close = _to_float(row[4] if len(row) > 4 else None)
         if close is None:
+            continue
+        try:
+            parsed.append((_parse_date(row[0]), close))
+        except ValueError:
+            continue
+    return _series_from_rows(parsed)
+
+
+def _fetch_json_price_list(url: str, params: dict) -> pd.Series | None:
+    try:
+        response = _http().get(
+            url,
+            params=params,
+            timeout=30,
+            headers={**HEADERS, "Referer": "https://m.stock.naver.com/"},
+        )
+        if response.status_code != 200:
+            return None
+        payload = response.json()
+    except Exception:
+        return None
+
+    items = payload if isinstance(payload, list) else []
+    if isinstance(payload, dict):
+        for key in ("priceInfos", "prices", "candleDataList", "data"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                items = value
+                break
+
+    parsed: list[tuple[datetime, float]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        date_raw = (
+            item.get("localTradedAt")
+            or item.get("localDateTime")
+            or item.get("date")
+            or item.get("bizdate")
+        )
+        close = _to_float(
+            item.get("closePrice")
+            or item.get("close")
+            or item.get("tradePrice")
+            or item.get("lastPrice")
+        )
+        if not date_raw or close is None:
             continue
         try:
             parsed.append((_parse_date(date_raw), close))
         except ValueError:
             continue
+    return _series_from_rows(parsed)
+
+
+def _fetch_naver_world_day_json(symbol: str, lookback_days: int) -> pd.Series | None:
+    """네이버 해외지수 일별 JSON. 페이지당 약 10개."""
+    max_pages = min(15, max(3, lookback_days // 8 + 1))
+    parsed: list[tuple[datetime, float]] = []
+
+    for page in range(1, max_pages + 1):
+        url = "https://finance.naver.com/world/worldDayListJson.naver"
+        try:
+            response = _http().get(
+                url,
+                params={"symbol": symbol, "fdtc": "0", "page": page},
+                timeout=30,
+                headers={**HEADERS, "Referer": f"https://finance.naver.com/world/sise.naver?symbol={symbol}"},
+            )
+            if response.status_code != 200:
+                print(f"NaverWorld HTTP {response.status_code} ({symbol} p{page})")
+                break
+            rows = response.json()
+            if not isinstance(rows, list) or not rows:
+                break
+            for item in rows:
+                close = _to_float(item.get("clos"))
+                date_raw = item.get("xymd")
+                if close is None or not date_raw:
+                    continue
+                parsed.append((_parse_date(date_raw), close))
+            if len(rows) < 10:
+                break
+            time.sleep(0.1)
+        except Exception as exc:
+            print(f"NaverWorld 실패 ({symbol} p{page}): {exc}")
+            break
 
     return _series_from_rows(parsed)
 
 
-def _parse_date(value: object) -> datetime:
-    text = re.sub(r"[./]", "-", str(value).strip())
-    if "T" in text:
-        text = text.split("T", 1)[0]
-    for size, fmt in ((10, "%Y-%m-%d"), (8, "%Y%m%d")):
+def _fetch_naver_html_pages(url_template: str, lookback_days: int) -> pd.Series | None:
+    max_pages = min(10, max(2, lookback_days // 20 + 1))
+    parsed: list[tuple[datetime, float]] = []
+
+    for page in range(1, max_pages + 1):
+        url = url_template.format(page=page)
         try:
-            return datetime.strptime(text[:size], fmt)
-        except ValueError:
-            continue
-    raise ValueError(f"지원하지 않는 날짜: {value}")
-
-
-def _fetch_naver_mobile_prices(url: str, lookback_days: int) -> pd.Series | None:
-    return _fetch_naver_json_series(
-        url, {"pageSize": max(lookback_days, 90), "page": 1}
-    )
-
-
-def _fetch_stooq(symbol: str, lookback_days: int) -> pd.Series | None:
-    end = datetime.now()
-    start = end - timedelta(days=lookback_days + 20)
-    hosts = (
-        "https://stooq.com/q/d/l/",
-        "https://stooq.pl/q/d/l/",
-    )
-    params = {
-        "s": symbol,
-        "i": "d",
-        "d1": start.strftime("%Y%m%d"),
-        "d2": end.strftime("%Y%m%d"),
-    }
-
-    for url in hosts:
-        try:
-            response = _http().get(url, params=params, timeout=20)
-            text = response.text.strip()
-            if response.status_code != 200 or not text:
-                continue
-            first_line = text.splitlines()[0]
-            if "Date" not in first_line:
-                print(f"Stooq 비정상 응답 ({symbol}): {first_line[:80]}")
-                continue
-
-            frame = pd.read_csv(StringIO(text))
-            if frame.empty or "Close" not in frame.columns:
-                continue
-
-            frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce")
-            close = frame.dropna(subset=["Date", "Close"]).set_index("Date")["Close"]
-            close = close[close > 0].astype(float).sort_index()
-            if not close.empty:
-                return close
+            response = _http().get(
+                url,
+                timeout=30,
+                headers={**HEADERS, "Referer": "https://finance.naver.com/marketindex/"},
+            )
+            if response.status_code != 200 or "<table" not in response.text:
+                break
+            tables = pd.read_html(StringIO(response.text))
         except Exception as exc:
-            print(f"Stooq 실패 ({symbol}, {url}): {exc}")
+            print(f"NaverMarket HTML 실패 (p{page}): {exc}")
+            break
 
-    return None
+        page_rows: list[tuple[datetime, float]] = []
+        for table in tables:
+            if table.shape[1] < 2:
+                continue
+            for _, item in table.iterrows():
+                close = _to_float(item.iloc[1])
+                if close is None:
+                    continue
+                try:
+                    page_rows.append((_parse_date(item.iloc[0]), close))
+                except ValueError:
+                    continue
+            if page_rows:
+                break
+        if not page_rows:
+            break
+        parsed.extend(page_rows)
+        time.sleep(0.1)
+
+    return _series_from_rows(parsed)
 
 
-def _fetch_fred(series_id: str, lookback_days: int) -> pd.Series | None:
+def _fetch_daum_days(symbol: str, lookback_days: int) -> pd.Series | None:
     try:
         response = _http().get(
-            "https://fred.stlouisfed.org/graph/fredgraph.csv",
-            params={"id": series_id},
-            timeout=20,
+            f"https://finance.daum.net/api/charts/{symbol}/days",
+            params={"limit": max(lookback_days, 120), "adjusted": "true"},
+            timeout=30,
+            headers={
+                **HEADERS,
+                "Referer": f"https://finance.daum.net/global/quotes/{symbol}",
+            },
         )
-        response.raise_for_status()
-        frame = pd.read_csv(StringIO(response.text))
-        if frame.empty or len(frame.columns) < 2:
+        if response.status_code != 200:
             return None
-
-        date_col, value_col = frame.columns[:2]
-        frame[date_col] = pd.to_datetime(frame[date_col], errors="coerce")
-        frame[value_col] = frame[value_col].map(_to_float)
-        frame = frame.dropna(subset=[date_col, value_col]).sort_values(date_col)
-        if lookback_days:
-            cutoff = datetime.now() - timedelta(days=lookback_days + 20)
-            frame = frame[frame[date_col] >= cutoff]
-        series = frame.set_index(date_col)[value_col].astype(float)
-        return series if not series.empty else None
+        items = response.json().get("data")
+        if not isinstance(items, list):
+            return None
+        parsed = []
+        for item in items:
+            close = _to_float(item.get("tradePrice") or item.get("closePrice"))
+            date_raw = item.get("date") or item.get("candleTime")
+            if close is None or not date_raw:
+                continue
+            parsed.append((_parse_date(date_raw), close))
+        return _series_from_rows(parsed)
     except Exception as exc:
-        print(f"FRED 실패 ({series_id}): {exc}")
+        print(f"Daum 실패 ({symbol}): {exc}")
         return None
 
 
-def _fetch_yahoo_chart(ticker: str, lookback_days: int) -> pd.Series | None:
-    range_map = "6mo" if lookback_days >= 90 else "3mo"
-    hosts = (
-        "https://query1.finance.yahoo.com/v8/finance/chart/",
-        "https://query2.finance.yahoo.com/v8/finance/chart/",
+def _fetch_cboe_vix(lookback_days: int) -> pd.Series | None:
+    urls = (
+        "https://cdn.cboe.com/api/global/delayed_quotes/charts/historical/VIX.json",
+        "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX.json",
     )
-
-    for host in hosts:
+    for url in urls:
         try:
-            response = _http().get(
-                f"{host}{ticker}",
-                params={"interval": "1d", "range": range_map},
-                timeout=20,
-            )
+            response = _http().get(url, timeout=30)
             if response.status_code != 200:
                 continue
             payload = response.json()
-            result = (payload.get("chart") or {}).get("result") or []
-            if not result:
+            items = payload.get("data") or payload.get("price") or payload
+            if isinstance(items, dict):
+                items = items.get("data") or items.get("prices") or []
+            if not isinstance(items, list):
                 continue
-            item = result[0]
-            timestamps = item.get("timestamp") or []
-            closes = (
-                ((item.get("indicators") or {}).get("quote") or [{}])[0].get("close")
-                or []
-            )
             parsed = []
-            for ts, close in zip(timestamps, closes):
-                price = _to_float(close)
-                if price is None:
+            for item in items:
+                if not isinstance(item, dict):
                     continue
-                parsed.append(
-                    (
-                        datetime.fromtimestamp(ts, tz=timezone.utc).replace(tzinfo=None),
-                        price,
-                    )
+                close = _to_float(
+                    item.get("close")
+                    or item.get("price")
+                    or item.get("last")
+                    or item.get("value")
                 )
+                date_raw = (
+                    item.get("date")
+                    or item.get("timestamp")
+                    or item.get("price_date")
+                )
+                if close is None or not date_raw:
+                    continue
+                try:
+                    parsed.append((_parse_date(date_raw), close))
+                except ValueError:
+                    continue
             series = _series_from_rows(parsed)
             if series is not None:
+                cutoff = datetime.now() - timedelta(days=lookback_days + 20)
+                series = series[series.index >= cutoff]
+                if not series.empty:
+                    return series
+        except Exception as exc:
+            print(f"CBOE VIX 실패: {exc}")
+
+    # 최신 호가만이라도 확보
+    try:
+        response = _http().get(
+            "https://cdn.cboe.com/api/global/delayed_quotes/quotes/VIX.json",
+            timeout=30,
+        )
+        if response.status_code == 200:
+            data = response.json().get("data") or {}
+            price = _to_float(
+                data.get("current_price") or data.get("price") or data.get("last_price")
+            )
+            if price is not None:
+                today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+                return pd.Series([price], index=[today])
+    except Exception as exc:
+        print(f"CBOE VIX quote 실패: {exc}")
+    return None
+
+
+def _fetch_fred_dgs10(lookback_days: int) -> pd.Series | None:
+    for attempt, delay in enumerate((1, 3, 6), start=1):
+        try:
+            response = _http().get(
+                "https://fred.stlouisfed.org/graph/fredgraph.csv",
+                params={"id": "DGS10"},
+                timeout=60,
+            )
+            response.raise_for_status()
+            frame = pd.read_csv(StringIO(response.text))
+            if frame.empty or len(frame.columns) < 2:
+                return None
+            date_col, value_col = frame.columns[:2]
+            frame[date_col] = pd.to_datetime(frame[date_col], errors="coerce")
+            frame[value_col] = frame[value_col].map(_to_float)
+            frame = frame.dropna(subset=[date_col, value_col]).sort_values(date_col)
+            cutoff = datetime.now() - timedelta(days=lookback_days + 20)
+            frame = frame[frame[date_col] >= cutoff]
+            series = frame.set_index(date_col)[value_col].astype(float)
+            if not series.empty:
                 return series
         except Exception as exc:
-            print(f"YahooChart 실패 ({ticker}): {exc}")
+            print(f"FRED 실패 (시도 {attempt}/3): {exc}")
+            time.sleep(delay)
+    return None
 
+
+def _fetch_treasury_10y(lookback_days: int) -> pd.Series | None:
+    """US Treasury Fiscal Data API - 일별 10년물."""
+    try:
+        response = _http().get(
+            "https://api.fiscaldata.treasury.gov/services/api/fiscal_service/"
+            "v2/accounting/od/avg_interest_rates",
+            params={
+                "filter": "security_desc:eq:Treasury Notes,security_type_desc:eq:Marketable",
+                "sort": "-record_date",
+                "page[size]": 100,
+            },
+            timeout=45,
+        )
+        # avg_interest_rates may not be daily 10Y; try yield curve endpoint style dump
+        if response.status_code != 200:
+            return None
+    except Exception:
+        pass
+
+    year = datetime.now().year
+    urls = (
+        f"https://home.treasury.gov/resource-center/data-chart-center/interest-rates/"
+        f"daily-treasury-rates.csv/{year}/all"
+        f"?type=daily_treasury_yield_curve&field_tdr_date_value={year}&page&_format=csv",
+        f"https://home.treasury.gov/resource-center/data-chart-center/interest-rates/"
+        f"daily-treasury-rates.csv/all/{year}"
+        f"?type=daily_treasury_yield_curve&field_tdr_date_value={year}&page&_format=csv",
+    )
+    for url in urls:
+        try:
+            response = _http().get(url, timeout=45)
+            if response.status_code != 200 or "Date" not in response.text[:200]:
+                continue
+            frame = pd.read_csv(StringIO(response.text))
+            cols = {str(c).strip(): c for c in frame.columns}
+            date_col = cols.get("Date")
+            ten_col = None
+            for key, original in cols.items():
+                if key.startswith("10") and "Yr" in key.replace(" ", ""):
+                    ten_col = original
+                    break
+                if key in {"10 Yr", "10 Yr.", "10-Year"}:
+                    ten_col = original
+                    break
+            if date_col is None or ten_col is None:
+                # common layout: Date, 1 Mo, ... 10 Yr ...
+                for c in frame.columns:
+                    if "10" in str(c) and "Yr" in str(c):
+                        ten_col = c
+                        break
+                if "Date" in frame.columns:
+                    date_col = "Date"
+            if date_col is None or ten_col is None:
+                continue
+            frame[date_col] = pd.to_datetime(frame[date_col], errors="coerce")
+            frame[ten_col] = frame[ten_col].map(_to_float)
+            frame = frame.dropna(subset=[date_col, ten_col]).sort_values(date_col)
+            cutoff = datetime.now() - timedelta(days=lookback_days + 20)
+            frame = frame[frame[date_col] >= cutoff]
+            series = frame.set_index(date_col)[ten_col].astype(float)
+            if not series.empty:
+                return series
+        except Exception as exc:
+            print(f"Treasury 실패: {exc}")
     return None
 
 
@@ -495,7 +554,7 @@ def _fetch_frankfurter(base: str, quote: str, lookback_days: int) -> pd.Series |
         f"?from={base}&to={quote}"
     )
     try:
-        response = _http().get(url, timeout=20)
+        response = _http().get(url, timeout=30)
         response.raise_for_status()
         rates = response.json().get("rates", {})
         parsed = [
@@ -514,11 +573,8 @@ def _fetch_coingecko_btc(lookback_days: int) -> pd.Series | None:
     try:
         response = _http().get(
             "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart",
-            params={
-                "vs_currency": "usd",
-                "days": min(lookback_days, 180),
-            },
-            timeout=20,
+            params={"vs_currency": "usd", "days": min(lookback_days, 180)},
+            timeout=30,
         )
         response.raise_for_status()
         points = response.json().get("prices", [])

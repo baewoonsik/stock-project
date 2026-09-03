@@ -90,6 +90,13 @@ def main() -> None:
     success_ratio = success_count / len(quotes)
     print(f"시장 데이터 수집 완료: {success_count}/{len(quotes)} ({success_ratio:.0%})")
 
+    if success_count < 20:
+        print(
+            f"시세 수집 부족 ({success_count}/{len(quotes)}). "
+            "Gemini 호출을 중단해 토큰을 절약합니다."
+        )
+        sys.exit(1)
+
     if success_ratio < MIN_MARKET_DATA_SUCCESS_RATIO:
         print(
             "경고: 시장 지수 일부 누락. 워치리스트 데이터로 리포트를 계속 생성합니다."
