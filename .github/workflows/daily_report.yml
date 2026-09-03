@@ -46,6 +46,22 @@ jobs:
           print('import ok')
           "
 
+      - name: 시세 수집 스모크 테스트
+        run: |
+          python -c "
+          from collectors.market import ensure_market_data_prefetched, fetch_market_quotes, fetch_watchlist_trends
+          ensure_market_data_prefetched()
+          quotes = fetch_market_quotes()
+          trends = fetch_watchlist_trends()
+          q_ok = sum(1 for q in quotes if q.price is not None)
+          t_ok = sum(1 for t in trends if t.price is not None)
+          print(f'시세 스모크: quotes {q_ok}/{len(quotes)}, trends {t_ok}/{len(trends)}')
+          if q_ok < 6:
+              print('경고: 시장 지수 수집률 낮음')
+          if t_ok < 5:
+              print('경고: 워치리스트 수집률 낮음')
+          "
+
       - name: 파이썬 스크립트 실행
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}

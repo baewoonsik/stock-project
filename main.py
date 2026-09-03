@@ -53,6 +53,7 @@ def main() -> None:
     try:
         from collectors.dart import fetch_financial_highlights, format_financial_data
         from collectors.market import (
+            ensure_market_data_prefetched,
             fetch_market_quotes,
             fetch_watchlist_trends,
             format_market_snapshot,
@@ -65,6 +66,7 @@ def main() -> None:
         raise
 
     print("워치리스트 추세 데이터 수집 중...")
+    ensure_market_data_prefetched()
     watchlist_trends = fetch_watchlist_trends()
     watchlist_data = format_watchlist_trends(watchlist_trends)
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -14,9 +15,63 @@ FDR_REQUEST_DELAY = 0.4
 FDR_DATA_SOURCES = (None, "Naver", "Yahoo")
 YFINANCE_RETRY_DELAYS = (5, 12, 20)
 YFINANCE_ONLY_TICKERS = {"^VIX", "GC=F", "^TNX"}
+YFINANCE_BATCH_SIZE = 5
+YFINANCE_BATCH_DELAY = 8
 
 _close_series_cache: dict[tuple[str, int], pd.Series | None] = {}
+_yfinance_close_cache: dict[str, pd.Series] = {}
+_yfinance_prefetched = False
 
+
+def _is_ci() -> bool:
+    return os.environ.get("GITHUB_ACTIONS") == "true"
+
+
+def _all_yfinance_tickers() -> list[str]:
+    tickers: list[str] = []
+    for item in MARKET_INDICES:
+        if item["yf"]:
+            tickers.append(item["yf"])
+    for item in WATCHLIST:
+        tickers.append(item["yf"])
+    return list(dict.fromkeys(tickers))
+
+
+def _prefetch_all_yfinance() -> None:
+    global _yfinance_prefetched
+
+    if _yfinance_prefetched:
+        return
+
+    tickers = _all_yfinance_tickers()
+    print(f"yfinance 일괄 prefetch 시작: {len(tickers)}개")
+
+    for start in range(0, len(tickers), YFINANCE_BATCH_SIZE):
+        batch = tickers[start : start + YFINANCE_BATCH_SIZE]
+        data = _download_yfinance_history_batch(batch, period="6mo")
+        for ticker in batch:
+            close = _get_close_series(data, ticker, batch)
+            if close is not None and not close.empty:
+                _yfinance_close_cache[ticker] = close
+                _close_series_cache[(f"yf:{ticker}", FDR_TREND_LOOKBACK_DAYS)] = close
+            else:
+                close = _fetch_close_series_yfinance(ticker, FDR_TREND_LOOKBACK_DAYS)
+                if close is not None and not close.empty:
+                    _yfinance_close_cache[ticker] = close
+                else:
+                    print(f"yfinance prefetch 실패: {ticker}")
+
+        if start + YFINANCE_BATCH_SIZE < len(tickers):
+            time.sleep(YFINANCE_BATCH_DELAY)
+
+    success = len(_yfinance_close_cache)
+    print(f"yfinance prefetch 완료: {success}/{len(tickers)}")
+    _yfinance_prefetched = True
+
+
+def ensure_market_data_prefetched() -> None:
+    if _is_ci():
+        _prefetch_all_yfinance()
 
 def _import_fdr():
     import FinanceDataReader as fdr
@@ -271,6 +326,19 @@ def _range_window(close: pd.Series, days: int) -> tuple[float | None, float | No
 
 
 def fetch_watchlist_trends() -> list[WatchlistTrend]:
+    if _is_ci():
+        _prefetch_all_yfinance()
+        trends = []
+        for item in WATCHLIST:
+            close = _yfinance_close_cache.get(item["yf"])
+            if close is not None and not close.empty:
+                trends.append(_build_watchlist_trend(item, close))
+            else:
+                trends.append(_empty_watchlist_trend(item))
+        success_count = sum(1 for trend in trends if trend.price is not None)
+        print(f"워치리스트 추세 수집 성공: {success_count}/{len(trends)}")
+        return trends
+
     trends: list[WatchlistTrend] = []
     yfinance_fallback: list[tuple[int, str]] = []
 
@@ -332,7 +400,9 @@ def _fetch_via_fdr(symbol: str) -> tuple[float | None, float | None]:
     return _price_change_from_close(close)
 
 
-def _download_yfinance_batch(tickers: list[str]) -> pd.DataFrame:
+def _download_yfinance_history_batch(
+    tickers: list[str], period: str = "5d"
+) -> pd.DataFrame:
     last_error: Exception | None = None
 
     for attempt, delay in enumerate(YFINANCE_RETRY_DELAYS, start=1):
@@ -340,7 +410,7 @@ def _download_yfinance_batch(tickers: list[str]) -> pd.DataFrame:
             yf = _import_yfinance()
             data = yf.download(
                 tickers,
-                period="5d",
+                period=period,
                 group_by="ticker",
                 auto_adjust=True,
                 threads=False,
@@ -351,16 +421,20 @@ def _download_yfinance_batch(tickers: list[str]) -> pd.DataFrame:
         except Exception as exc:
             last_error = exc
             print(
-                f"yfinance 배치 실패 (시도 {attempt}/{len(YFINANCE_RETRY_DELAYS)}): {exc}"
+                f"yfinance 배치 실패 (시도 {attempt}/{len(YFINANCE_RETRY_DELAYS)}, "
+                f"{period}): {exc}"
             )
 
         time.sleep(delay)
 
     if last_error:
-        print(f"yfinance 배치 최종 실패: {last_error}")
+        print(f"yfinance 배치 최종 실패 ({period}): {last_error}")
 
     return pd.DataFrame()
 
+
+def _download_yfinance_batch(tickers: list[str]) -> pd.DataFrame:
+    return _download_yfinance_history_batch(tickers, period="5d")
 
 def _get_close_series(
     data: pd.DataFrame, ticker: str, batch: list[str]
@@ -389,6 +463,42 @@ def _fetch_via_yfinance(ticker: str, data: pd.DataFrame, batch: list[str]) -> tu
 
 
 def fetch_market_quotes() -> list[Quote]:
+    if _is_ci():
+        _prefetch_all_yfinance()
+        quotes: list[Quote] = []
+
+        for item in MARKET_INDICES:
+            close = _yfinance_close_cache.get(item["yf"])
+            price, change_pct = _price_change_from_close(close) if close is not None else (None, None)
+            quotes.append(
+                Quote(
+                    name=item["name"],
+                    ticker=item["yf"],
+                    price=price,
+                    change_pct=change_pct,
+                    group=item["group"],
+                    source="yfinance" if price is not None else "",
+                )
+            )
+
+        for item in WATCHLIST:
+            close = _yfinance_close_cache.get(item["yf"])
+            price, change_pct = _price_change_from_close(close) if close is not None else (None, None)
+            quotes.append(
+                Quote(
+                    name=item["name"],
+                    ticker=item["yf"],
+                    price=price,
+                    change_pct=change_pct,
+                    group="워치리스트",
+                    source="yfinance" if price is not None else "",
+                )
+            )
+
+        success_count = sum(1 for quote in quotes if quote.price is not None)
+        print(f"시세 수집 성공: {success_count}/{len(quotes)}")
+        return quotes
+
     instruments = _get_instruments()
     quotes: list[Quote] = []
     yfinance_fallback: list[tuple[int, str]] = []
