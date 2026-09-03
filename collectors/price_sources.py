@@ -3,6 +3,7 @@ from __future__ import annotations
 import ast
 import json
 import re
+import os
 from datetime import datetime, timedelta, timezone
 from io import StringIO
 
@@ -23,6 +24,20 @@ HEADERS = {
 NAVER_INDEX_SYMBOLS = {
     "KS11": "KOSPI",
     "KQ11": "KOSDAQ",
+}
+
+NAVER_WORLD_INDEX = {
+    "^GSPC": (".INX", ".GSPC"),
+    "^IXIC": (".IXIC",),
+    "^DJI": (".DJI",),
+    "^N225": (".N225",),
+    "^HSI": (".HSI",),
+    "^VIX": (".VIX", ".VXN"),
+}
+
+NAVER_COMMODITY = {
+    "GC=F": "CMDT_GC",
+    "CL=F": "OIL_CL",
 }
 
 STOOQ_SYMBOLS = {
@@ -49,6 +64,10 @@ FX_PAIRS = {
     "JPYKRW=X": ("JPY", "KRW"),
 }
 
+FRED_SERIES = {
+    "^TNX": "DGS10",
+}
+
 _session: requests.Session | None = None
 
 
@@ -66,7 +85,7 @@ def _to_float(value: object) -> float | None:
     if isinstance(value, (int, float)):
         return float(value)
     text = str(value).replace(",", "").replace("%", "").strip()
-    if not text or text in {"-", "N/A", "null"}:
+    if not text or text in {"-", "N/A", "null", "."}:
         return None
     try:
         return float(text)
@@ -99,6 +118,22 @@ def fetch_close_http(
         if close is not None:
             return close, "Naver"
 
+    if yf in NAVER_WORLD_INDEX:
+        for code in NAVER_WORLD_INDEX[yf]:
+            close = _fetch_naver_world_index(code, lookback_days)
+            if close is not None:
+                return close, "Naver"
+
+    if yf in NAVER_COMMODITY:
+        close = _fetch_naver_commodity(NAVER_COMMODITY[yf], lookback_days)
+        if close is not None:
+            return close, "Naver"
+
+    if yf in FRED_SERIES:
+        close = _fetch_fred(FRED_SERIES[yf], lookback_days)
+        if close is not None:
+            return close, "FRED"
+
     if yf in STOOQ_SYMBOLS:
         close = _fetch_stooq(STOOQ_SYMBOLS[yf], lookback_days)
         if close is not None:
@@ -119,6 +154,11 @@ def fetch_close_http(
         if close is not None:
             return close, "Stooq"
 
+    if yf and os.environ.get("GITHUB_ACTIONS") != "true":
+        close = _fetch_yahoo_chart(yf, lookback_days)
+        if close is not None:
+            return close, "YahooChart"
+
     return None, ""
 
 
@@ -138,6 +178,123 @@ def _fetch_naver_index(symbol: str, lookback_days: int) -> pd.Series | None:
     return _fetch_naver_mobile_prices(
         f"https://m.stock.naver.com/api/index/{symbol}/price", lookback_days
     )
+
+
+def _fetch_naver_world_index(code: str, lookback_days: int) -> pd.Series | None:
+    candle_count = max(lookback_days, 90)
+    endpoints = (
+        (
+            f"https://api.stock.naver.com/chart/foreign/index/{code}",
+            {"periodType": "day", "candleCount": candle_count},
+        ),
+        (
+            f"https://m.stock.naver.com/front-api/product/chart/foreign/index/{code}",
+            {"periodType": "day", "maxCount": candle_count},
+        ),
+        (
+            f"https://api.stock.naver.com/index/{code}/price",
+            {"page": 1, "pageSize": candle_count},
+        ),
+        (
+            f"https://m.stock.naver.com/api/index/{code}/price",
+            {"page": 1, "pageSize": candle_count},
+        ),
+    )
+
+    for url, params in endpoints:
+        close = _fetch_naver_json_series(url, params)
+        if close is not None:
+            return close
+    return None
+
+
+def _fetch_naver_commodity(code: str, lookback_days: int) -> pd.Series | None:
+    page_size = max(lookback_days, 90)
+    endpoints = (
+        (
+            f"https://api.stock.naver.com/marketindex/oilgold/{code}/price",
+            {"page": 1, "pageSize": page_size},
+        ),
+        (
+            f"https://m.stock.naver.com/front-api/marketIndex/prices/{code}",
+            {"page": 1, "pageSize": page_size},
+        ),
+        (
+            f"https://api.stock.naver.com/marketindex/{code}/price",
+            {"page": 1, "pageSize": page_size},
+        ),
+    )
+
+    for url, params in endpoints:
+        close = _fetch_naver_json_series(url, params)
+        if close is not None:
+            return close
+    return None
+
+
+def _fetch_naver_json_series(url: str, params: dict) -> pd.Series | None:
+    try:
+        response = _http().get(url, params=params, timeout=20)
+        if response.status_code != 200:
+            return None
+        payload = response.json()
+    except Exception as exc:
+        print(f"Naver JSON 실패 ({url}): {exc}")
+        return None
+
+    items = _extract_price_items(payload)
+    parsed: list[tuple[datetime, float]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        date_raw = (
+            item.get("localTradedAt")
+            or item.get("localDateTime")
+            or item.get("localDate")
+            or item.get("bizdate")
+            or item.get("date")
+            or item.get("trdDd")
+        )
+        close = _to_float(
+            item.get("closePrice")
+            or item.get("close")
+            or item.get("closeVal")
+            or item.get("lastPrice")
+            or item.get("nv")
+            or item.get("value")
+        )
+        if not date_raw or close is None:
+            continue
+        try:
+            parsed.append((_parse_date(date_raw), close))
+        except ValueError:
+            continue
+
+    return _series_from_rows(parsed)
+
+
+def _extract_price_items(payload: object) -> list:
+    if isinstance(payload, list):
+        return payload
+    if not isinstance(payload, dict):
+        return []
+
+    for key in (
+        "priceInfos",
+        "prices",
+        "candleDataList",
+        "chartDataList",
+        "data",
+        "result",
+    ):
+        value = payload.get(key)
+        if isinstance(value, list) and value:
+            return value
+        if isinstance(value, dict):
+            nested = _extract_price_items(value)
+            if nested:
+                return nested
+    return []
 
 
 def _fetch_naver_fchart(symbol: str, lookback_days: int) -> pd.Series | None:
@@ -202,6 +359,8 @@ def _parse_naver_fchart(text: str) -> pd.Series | None:
 
 def _parse_date(value: object) -> datetime:
     text = re.sub(r"[./]", "-", str(value).strip())
+    if "T" in text:
+        text = text.split("T", 1)[0]
     for size, fmt in ((10, "%Y-%m-%d"), (8, "%Y%m%d")):
         try:
             return datetime.strptime(text[:size], fmt)
@@ -211,73 +370,121 @@ def _parse_date(value: object) -> datetime:
 
 
 def _fetch_naver_mobile_prices(url: str, lookback_days: int) -> pd.Series | None:
-    try:
-        response = _http().get(
-            url,
-            params={"pageSize": max(lookback_days, 90), "page": 1},
-            timeout=20,
-        )
-        response.raise_for_status()
-        payload = response.json()
-    except Exception as exc:
-        print(f"Naver mobile 실패 ({url}): {exc}")
-        return None
-
-    items = payload.get("priceInfos") or payload.get("prices") or []
-    if isinstance(payload, list):
-        items = payload
-
-    parsed: list[tuple[datetime, float]] = []
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        date_raw = item.get("localTradedAt") or item.get("bizdate") or item.get("date")
-        close = _to_float(
-            item.get("closePrice")
-            or item.get("close")
-            or item.get("closeVal")
-            or item.get("lastPrice")
-        )
-        if not date_raw or close is None:
-            continue
-        try:
-            parsed.append((_parse_date(date_raw), close))
-        except ValueError:
-            continue
-
-    return _series_from_rows(parsed)
+    return _fetch_naver_json_series(
+        url, {"pageSize": max(lookback_days, 90), "page": 1}
+    )
 
 
 def _fetch_stooq(symbol: str, lookback_days: int) -> pd.Series | None:
     end = datetime.now()
     start = end - timedelta(days=lookback_days + 20)
+    hosts = (
+        "https://stooq.com/q/d/l/",
+        "https://stooq.pl/q/d/l/",
+    )
+    params = {
+        "s": symbol,
+        "i": "d",
+        "d1": start.strftime("%Y%m%d"),
+        "d2": end.strftime("%Y%m%d"),
+    }
+
+    for url in hosts:
+        try:
+            response = _http().get(url, params=params, timeout=20)
+            text = response.text.strip()
+            if response.status_code != 200 or not text:
+                continue
+            first_line = text.splitlines()[0]
+            if "Date" not in first_line:
+                print(f"Stooq 비정상 응답 ({symbol}): {first_line[:80]}")
+                continue
+
+            frame = pd.read_csv(StringIO(text))
+            if frame.empty or "Close" not in frame.columns:
+                continue
+
+            frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce")
+            close = frame.dropna(subset=["Date", "Close"]).set_index("Date")["Close"]
+            close = close[close > 0].astype(float).sort_index()
+            if not close.empty:
+                return close
+        except Exception as exc:
+            print(f"Stooq 실패 ({symbol}, {url}): {exc}")
+
+    return None
+
+
+def _fetch_fred(series_id: str, lookback_days: int) -> pd.Series | None:
     try:
         response = _http().get(
-            "https://stooq.com/q/d/l/",
-            params={
-                "s": symbol,
-                "i": "d",
-                "d1": start.strftime("%Y%m%d"),
-                "d2": end.strftime("%Y%m%d"),
-            },
+            "https://fred.stlouisfed.org/graph/fredgraph.csv",
+            params={"id": series_id},
             timeout=20,
         )
         response.raise_for_status()
-        text = response.text.strip()
-        if not text or "Date" not in text.splitlines()[0]:
+        frame = pd.read_csv(StringIO(response.text))
+        if frame.empty or len(frame.columns) < 2:
             return None
 
-        frame = pd.read_csv(StringIO(text))
-        if frame.empty or "Close" not in frame.columns:
-            return None
-
-        frame["Date"] = pd.to_datetime(frame["Date"], errors="coerce")
-        close = frame.dropna(subset=["Date", "Close"]).set_index("Date")["Close"]
-        close = close[close > 0].astype(float).sort_index()
-        return close if not close.empty else None
+        date_col, value_col = frame.columns[:2]
+        frame[date_col] = pd.to_datetime(frame[date_col], errors="coerce")
+        frame[value_col] = frame[value_col].map(_to_float)
+        frame = frame.dropna(subset=[date_col, value_col]).sort_values(date_col)
+        if lookback_days:
+            cutoff = datetime.now() - timedelta(days=lookback_days + 20)
+            frame = frame[frame[date_col] >= cutoff]
+        series = frame.set_index(date_col)[value_col].astype(float)
+        return series if not series.empty else None
     except Exception as exc:
-        print(f"Stooq 실패 ({symbol}): {exc}")
+        print(f"FRED 실패 ({series_id}): {exc}")
         return None
+
+
+def _fetch_yahoo_chart(ticker: str, lookback_days: int) -> pd.Series | None:
+    range_map = "6mo" if lookback_days >= 90 else "3mo"
+    hosts = (
+        "https://query1.finance.yahoo.com/v8/finance/chart/",
+        "https://query2.finance.yahoo.com/v8/finance/chart/",
+    )
+
+    for host in hosts:
+        try:
+            response = _http().get(
+                f"{host}{ticker}",
+                params={"interval": "1d", "range": range_map},
+                timeout=20,
+            )
+            if response.status_code != 200:
+                continue
+            payload = response.json()
+            result = (payload.get("chart") or {}).get("result") or []
+            if not result:
+                continue
+            item = result[0]
+            timestamps = item.get("timestamp") or []
+            closes = (
+                ((item.get("indicators") or {}).get("quote") or [{}])[0].get("close")
+                or []
+            )
+            parsed = []
+            for ts, close in zip(timestamps, closes):
+                price = _to_float(close)
+                if price is None:
+                    continue
+                parsed.append(
+                    (
+                        datetime.fromtimestamp(ts, tz=timezone.utc).replace(tzinfo=None),
+                        price,
+                    )
+                )
+            series = _series_from_rows(parsed)
+            if series is not None:
+                return series
+        except Exception as exc:
+            print(f"YahooChart 실패 ({ticker}): {exc}")
+
+    return None
 
 
 def _fetch_frankfurter(base: str, quote: str, lookback_days: int) -> pd.Series | None:
@@ -316,7 +523,10 @@ def _fetch_coingecko_btc(lookback_days: int) -> pd.Series | None:
         response.raise_for_status()
         points = response.json().get("prices", [])
         parsed = [
-            (datetime.fromtimestamp(ts / 1000, tz=timezone.utc).replace(tzinfo=None), _to_float(price))
+            (
+                datetime.fromtimestamp(ts / 1000, tz=timezone.utc).replace(tzinfo=None),
+                _to_float(price),
+            )
             for ts, price in points
         ]
         parsed = [(day, price) for day, price in parsed if price is not None]

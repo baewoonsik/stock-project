@@ -389,6 +389,15 @@ def format_watchlist_trends(trends: list[WatchlistTrend]) -> str:
     return "\n".join(lines)
 
 
+def _is_korean_fdr_symbol(symbol: str | None) -> bool:
+    if not symbol:
+        return False
+    text = str(symbol)
+    if text.isdigit() and len(text) == 6:
+        return True
+    return text in {"KS11", "KQ11"}
+
+
 def _fetch_via_fdr(symbol: str) -> tuple[float | None, float | None]:
     close = _fetch_close_series_fdr(symbol, FDR_LOOKBACK_DAYS)
     if close is None:
@@ -501,7 +510,7 @@ def fetch_market_quotes() -> list[Quote]:
             if price is not None:
                 source = "yfinance"
 
-        if price is None and fdr_symbol:
+        if price is None and fdr_symbol and _is_korean_fdr_symbol(str(fdr_symbol)):
             price, change_pct = _fetch_via_fdr(str(fdr_symbol))
             if price is not None:
                 source = "FDR"
