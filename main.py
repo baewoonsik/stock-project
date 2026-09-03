@@ -4,21 +4,24 @@ from datetime import datetime
 
 import requests
 
-from collectors.dart import fetch_financial_highlights, format_financial_data
-from collectors.market import (
-    fetch_market_quotes,
-    fetch_watchlist_trends,
-    format_market_snapshot,
-    format_watchlist_trends,
+from config import (
+    MIN_MARKET_DATA_SUCCESS_RATIO,
+    MIN_WATCHLIST_SUCCESS_RATIO,
+    SLACK_MESSAGE_MAX_LENGTH,
+    WATCHLIST,
 )
-from collectors.news import fetch_news_items, format_news_data
-from config import MIN_MARKET_DATA_SUCCESS_RATIO, SLACK_MESSAGE_MAX_LENGTH
-from report.generator import extract_facts, generate_report_parts
 
 
 def validate_env() -> None:
-    if not os.environ.get("GEMINI_API_KEY") or not os.environ.get("SLACK_WEBHOOK_URL"):
-        print("API 키 또는 웹훅 URL이 설정되지 않았습니다.")
+    missing = []
+    if not os.environ.get("GEMINI_API_KEY"):
+        missing.append("GEMINI_API_KEY")
+    if not os.environ.get("SLACK_WEBHOOK_URL"):
+        missing.append("SLACK_WEBHOOK_URL")
+
+    if missing:
+        print(f"환경변수 누락: {', '.join(missing)}")
+        print("GitHub Secrets 또는 export 설정을 확인하세요.")
         sys.exit(1)
 
 
@@ -47,6 +50,38 @@ def send_to_slack(messages: list[str]) -> None:
 def main() -> None:
     validate_env()
 
+    try:
+        from collectors.dart import fetch_financial_highlights, format_financial_data
+        from collectors.market import (
+            fetch_market_quotes,
+            fetch_watchlist_trends,
+            format_market_snapshot,
+            format_watchlist_trends,
+        )
+        from collectors.news import fetch_news_items, format_news_data
+        from report.generator import extract_facts, generate_report_parts
+    except Exception as exc:
+        print(f"모듈 import 실패: {exc}")
+        raise
+
+    print("워치리스트 추세 데이터 수집 중...")
+    watchlist_trends = fetch_watchlist_trends()
+    watchlist_data = format_watchlist_trends(watchlist_trends)
+
+    watchlist_success = sum(1 for trend in watchlist_trends if trend.price is not None)
+    watchlist_ratio = watchlist_success / len(WATCHLIST)
+    print(
+        f"워치리스트 추세 수집: {watchlist_success}/{len(WATCHLIST)} "
+        f"({watchlist_ratio:.0%})"
+    )
+
+    if watchlist_ratio < MIN_WATCHLIST_SUCCESS_RATIO:
+        print(
+            "워치리스트 시세 수집률이 낮아 리포트를 중단합니다. "
+            f"(최소 {MIN_WATCHLIST_SUCCESS_RATIO:.0%} 필요)"
+        )
+        sys.exit(1)
+
     print("시장 데이터 수집 중...")
     quotes = fetch_market_quotes()
     market_data = format_market_snapshot(quotes)
@@ -57,14 +92,8 @@ def main() -> None:
 
     if success_ratio < MIN_MARKET_DATA_SUCCESS_RATIO:
         print(
-            "시장 데이터 수집률이 낮아 리포트를 중단합니다. "
-            f"(최소 {MIN_MARKET_DATA_SUCCESS_RATIO:.0%} 필요)"
+            "경고: 시장 지수 일부 누락. 워치리스트 데이터로 리포트를 계속 생성합니다."
         )
-        sys.exit(1)
-
-    print("워치리스트 추세 데이터 수집 중...")
-    watchlist_trends = fetch_watchlist_trends()
-    watchlist_data = format_watchlist_trends(watchlist_trends)
 
     prices_by_stock = {
         trend.stock_code: trend.price

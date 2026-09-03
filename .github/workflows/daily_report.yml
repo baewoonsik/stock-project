@@ -11,6 +11,7 @@ permissions:
 jobs:
   build_and_run:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
 
     steps:
       - name: 저장소 코드 불러오기
@@ -25,6 +26,25 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+
+      - name: Secrets 확인
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          test -n "$GEMINI_API_KEY" || (echo "GEMINI_API_KEY secret 누락" && exit 1)
+          test -n "$SLACK_WEBHOOK_URL" || (echo "SLACK_WEBHOOK_URL secret 누락" && exit 1)
+          echo "Secrets 확인 완료"
+
+      - name: Import 확인
+        run: |
+          python -c "
+          from collectors.market import fetch_market_quotes
+          from collectors.dart import fetch_financial_highlights
+          from collectors.news import fetch_news_items
+          from report.generator import extract_facts
+          print('import ok')
+          "
 
       - name: 파이썬 스크립트 실행
         env:

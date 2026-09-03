@@ -4,9 +4,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-import FinanceDataReader as fdr
 import pandas as pd
-import yfinance as yf
 
 from config import MARKET_INDICES, WATCHLIST
 
@@ -18,6 +16,18 @@ YFINANCE_RETRY_DELAYS = (5, 12, 20)
 YFINANCE_ONLY_TICKERS = {"^VIX", "GC=F", "^TNX"}
 
 _close_series_cache: dict[tuple[str, int], pd.Series | None] = {}
+
+
+def _import_fdr():
+    import FinanceDataReader as fdr
+
+    return fdr
+
+
+def _import_yfinance():
+    import yfinance as yf
+
+    return yf
 
 
 @dataclass
@@ -145,6 +155,7 @@ def _fetch_close_series_fdr(symbol: str, lookback_days: int) -> pd.Series | None
 
     for source in FDR_DATA_SOURCES:
         try:
+            fdr = _import_fdr()
             if source:
                 data = fdr.DataReader(symbol, start, end, data_source=source)
             else:
@@ -255,6 +266,7 @@ def _download_yfinance_batch(tickers: list[str]) -> pd.DataFrame:
 
     for attempt, delay in enumerate(YFINANCE_RETRY_DELAYS, start=1):
         try:
+            yf = _import_yfinance()
             data = yf.download(
                 tickers,
                 period="5d",
